@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/crgimenes/glaze"
+	"github.com/dolfly/glaze"
 )
 
 //go:embed hooks.js

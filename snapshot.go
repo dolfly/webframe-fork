@@ -3,7 +3,7 @@ package webframe
 import (
 	"errors"
 
-	"github.com/crgimenes/glaze"
+	"github.com/dolfly/glaze"
 )
 
 // ErrSnapshotUnsupported is returned when the platform's WebView backend cannot
