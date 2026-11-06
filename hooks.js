@@ -1,0 +1,224 @@
+// Called by webframe.go with its config: {env, dialogs, accept}.
+(function (config) {
+  if (window.__webframe_hooks) return;
+  window.__webframe_hooks = true;
+
+  // Keep the originals, so a page that replaces these later can't break
+  // the hooks or the results they report.
+  var stringify = JSON.stringify;
+  var indirectEval = window.eval;
+  var NativePromise = Promise;
+
+  // Defines name on window so the page can't replace it.
+  function lock(name, value) {
+    Object.defineProperty(window, name, { value: value, writable: false, configurable: false, enumerable: false });
+  }
+
+  var queue = [];
+  var busy = false;
+
+  // Bound calls run on separate goroutines in Go, so messages are sent in
+  // batches with at most one in flight to keep them ordered.
+  function flush() {
+    if (busy || !queue.length) return;
+    if (typeof window.__webframe !== "function") {
+      busy = true;
+      setTimeout(function () { busy = false; flush(); }, 0);
+      return;
+    }
+    var batch = queue;
+    queue = [];
+    busy = true;
+    window.__webframe(batch).then(done, done);
+  }
+
+  function done() {
+    busy = false;
+    flush();
+  }
+
+  function send(kind, level, text, id, csp) {
+    queue[queue.length] = { kind: kind, level: level || "", text: text || "", id: id || 0, csp: !!csp };
+    flush();
+  }
+
+  function indent(stack) {
+    return stack.split("\n").filter(Boolean).map(function (l) {
+      return /^\s/.test(l) ? l : "    " + l;
+    }).join("\n");
+  }
+
+  function fmtErr(e) {
+    var head = (e.name || "Error") + ": " + e.message;
+    var stack = typeof e.stack === "string" ? e.stack.trim() : "";
+    if (!stack) return head;
+    if (stack.indexOf(head) === 0) return stack;
+    return head + "\n" + indent(stack);
+  }
+
+  function fmt(v, quote) {
+    switch (typeof v) {
+      case "string": return quote ? stringify(v) : v;
+      case "undefined": return "undefined";
+      case "function": return "[Function: " + (v.name || "(anonymous)") + "]";
+      case "symbol": return v.toString();
+      case "bigint": return v + "n";
+      case "number": case "boolean": return String(v);
+    }
+    if (v === null) return "null";
+    if (v instanceof Error) return fmtErr(v);
+    var stack = [];
+    try {
+      var s = stringify(v, function (k, x) {
+        switch (typeof x) {
+          case "function": return "[Function: " + (x.name || "(anonymous)") + "]";
+          case "symbol": return x.toString();
+          case "bigint": return x + "n";
+          case "undefined": return k === "" ? undefined : "undefined";
+        }
+        if (x === null || typeof x !== "object") return x;
+        if (x instanceof Error) return fmtErr(x);
+        if (typeof Node !== "undefined" && x instanceof Node) return "<" + x.nodeName.toLowerCase() + ">";
+        if (stack.length) stack.splice(stack.indexOf(this) + 1);
+        if (stack.indexOf(x) !== -1) return "[Circular]";
+        stack.push(x);
+        return x;
+      });
+      return s === undefined ? String(v) : s;
+    } catch (e) {
+      return String(v);
+    }
+  }
+
+  function args(a) {
+    return Array.prototype.map.call(a, function (x) { return fmt(x); }).join(" ");
+  }
+
+  ["log", "info", "warn", "error", "debug", "trace", "dir"].forEach(function (m) {
+    var orig = console[m];
+    console[m] = function () {
+      var text = args(arguments);
+      if (m === "trace") text = (text || "Trace") + "\n" + indent((new Error().stack || "").split("\n").slice(1).join("\n"));
+      send("console", m, text);
+      if (orig) return orig.apply(console, arguments);
+    };
+  });
+
+  var origAssert = console.assert;
+  console.assert = function (cond) {
+    if (!cond) {
+      var rest = args(Array.prototype.slice.call(arguments, 1));
+      send("console", "assert", "Assertion failed" + (rest ? ": " + rest : ""));
+    }
+    if (origAssert) return origAssert.apply(console, arguments);
+  };
+
+  window.addEventListener("error", function (e) {
+    var t = e.target;
+    if (t && t !== window && t.nodeType === 1) {
+      send("exception", "resource", "Failed to load resource: <" + t.nodeName.toLowerCase() + "> " + (t.currentSrc || t.src || t.href || ""));
+      return;
+    }
+    var s = "Uncaught " + (e.error != null ? fmt(e.error) : e.message || "error");
+    if (e.filename && !(e.error && e.error.stack)) s += "\n    at " + e.filename + ":" + e.lineno + ":" + e.colno;
+    send("exception", "error", s);
+  }, true);
+
+  window.addEventListener("unhandledrejection", function (e) {
+    send("exception", "rejection", "Unhandled promise rejection: " + fmt(e.reason));
+  });
+
+  window.close = function () { send("close"); };
+
+  lock("webframe", Object.freeze({
+    env: Object.freeze(Object.assign(Object.create(null), config.env)),
+    exit: function (code) {
+      if (code === undefined) code = 0;
+      code = Number(code);
+      send("exit", "", "", Number.isInteger(code) ? code : 1);
+    }
+  }));
+
+  // Where the web view doesn't let webframe answer script dialogs, answer
+  // them here instead of letting the engine show its own.
+  if (config.dialogs) {
+    var dialog = function (m) { send("console", "dialog", m === undefined ? "" : String(m)); };
+    window.alert = function (m) { dialog(m); };
+    window.confirm = function (m) { dialog(m); return config.accept; };
+    window.prompt = function (m, text) {
+      dialog(m);
+      return config.accept ? (text === undefined ? "" : String(text)) : null;
+    };
+  }
+
+  // Deferred so the page's own load handlers run first.
+  window.addEventListener("load", function () { setTimeout(function () { send("load"); }, 0); });
+
+  send("ready");
+
+  // Drops the frames of the eval machinery below the evaluated code.
+  function evalErr(e) {
+    if (e instanceof Error && typeof e.stack === "string") {
+      var lines = e.stack.split("\n");
+      for (var i = 0; i < lines.length; i++) {
+        if (/^\s*(eval code@|at eval \(|at <anonymous>:)/.test(lines[i])) break;
+      }
+      try {
+        Object.defineProperty(e, "stack", { value: lines.slice(0, i).join("\n"), configurable: true });
+      } catch (_) {}
+    }
+    return "Uncaught " + fmt(e);
+  }
+
+  // Whether a syntax error means the source ended too soon, so more lines
+  // could complete it. Messages are from JavaScriptCore and V8.
+  function incomplete(e) {
+    return e instanceof SyntaxError &&
+      /^(Unexpected end of (script|input)|Unexpected EOF|Unterminated template|Multiline comment was not closed)/.test(e.message);
+  }
+
+  function settle(id, r) {
+    NativePromise.resolve(r).then(
+      function (v) { send("eval", "", fmt(v, true), id); },
+      function (e) { send("evalerr", "", evalErr(e), id); }
+    );
+  }
+
+  lock("__webframe_eval", function (id, src) {
+    var r;
+    try {
+      r = indirectEval(src);
+    } catch (e) {
+      // CSP without 'unsafe-eval': ask Go to inject src as an expression.
+      if (e instanceof EvalError && /unsafe-eval/.test(e.message)) {
+        send("evalerr", "", src, id, true);
+        return;
+      }
+      send("evalerr", incomplete(e) ? "incomplete" : "", evalErr(e), id);
+      return;
+    }
+    settle(id, r);
+  });
+
+  // The CSP fallback runs as three scripts. If the middle one doesn't parse,
+  // begin is never matched by run, and end reports it.
+  var started = {};
+  lock("__webframe_expr_begin", function (id) { started[id] = false; });
+  lock("__webframe_expr_run", function (id, thunk) {
+    started[id] = true;
+    var r;
+    try {
+      r = thunk();
+    } catch (e) {
+      send("evalerr", "", evalErr(e), id);
+      return;
+    }
+    settle(id, r);
+  });
+  lock("__webframe_expr_end", function (id) {
+    if (started[id] === false) {
+      send("evalerr", "", "Uncaught SyntaxError: this page's Content-Security-Policy blocks eval, so only a single expression can be evaluated", id);
+    }
+    delete started[id];
+  });
+})
