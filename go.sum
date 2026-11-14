@@ -1,4 +1,6 @@
 github.com/dolfly/glaze v0.2.1 h1:q+SwhMrLoBcv51AJGraOZNGOxH+gTOsGPo6px0R8hK0=
 github.com/dolfly/glaze v0.2.1/go.mod h1:dwHyKQlawNYk1F95skbEQal++KXwnVwPFpf3fCU26iQ=
+github.com/dolfly/glaze v0.4.0 h1:zOfg8WtFNqJwTJ8lo+SkyeMo3FwGhA12iJRfanIU4NA=
+github.com/dolfly/glaze v0.4.0/go.mod h1:dwHyKQlawNYk1F95skbEQal++KXwnVwPFpf3fCU26iQ=
 github.com/ebitengine/purego v0.11.3 h1:OB+JLpdm7ioymhyA+6s5kbb/uOuYycAgL8NNTFc5MLg=
 github.com/ebitengine/purego v0.11.3/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
